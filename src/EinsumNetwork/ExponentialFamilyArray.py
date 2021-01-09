@@ -1,4 +1,5 @@
 import torch
+from torch.nn.functional import multilabel_soft_margin_loss
 from utils import one_hot
 
 
@@ -575,3 +576,79 @@ class CategoricalArray(ExponentialFamilyArray):
             dist = params.reshape(self.num_var, *self.array_shape, self.num_dims, self.K)
             mode = torch.argmax(dist, -1).type(dtype)
             return shift_last_axis_to(mode, 1)
+
+class PoissonArray(ExponentialFamilyArray):
+    """Implementation of Poission distribution."""
+
+    def __init__(self, num_var, num_dims, array_shape, min_lambda=1e-5, max_lambda=1e1, use_em=True):
+        super(PoissonArray, self).__init__(num_var, num_dims, array_shape, num_dims, use_em=use_em)
+        assert min_lambda >= 0.0, f"Minimum lambda value needs to be larger than 0 but was {min_lambda}"
+        assert max_lambda > min_lambda, f"Maximum lambda value needs to be larger than minumum lambda value."
+        self.min_lambda = min_lambda
+        self.max_lambda = max_lambda
+
+    def default_initializer(self):
+        phi = (self.min_lambda + (self.max_lambda - self.min_lambda) * torch.rand(self.num_var, *self.array_shape, self.num_dims))
+        return phi
+
+    def project_params(self, phi):
+        phi = torch.clamp(phi, min=self.min_lambda, max=self.max_lambda)
+        return phi
+
+    def reparam_function(self):
+        def reparam(params_in):
+            lmbda = self.min_lambda + torch.sigmoid(params_in) * (self.max_lambda - self.min_lambda)
+            return lmbda
+        return reparam
+
+    def sufficient_statistics(self, x):
+        if len(x.shape) == 2:
+            stats = x.unsqueeze(-1)
+        elif len(x.shape) == 3:
+            stats = x
+        else:
+            raise AssertionError("Input must be 2 or 3 dimensional tensor.")
+        return stats
+
+    def expectation_to_natural(self, phi):
+        theta = torch.log(phi)
+        return theta
+
+    def log_normalizer(self, theta):
+        return torch.sum(torch.exp(theta), -1)
+
+    def log_h(self, x):
+        log_h = -1 * torch.lgamma(x + 1.0)  # trick: exp(lgamma(x + 1)) == x! (factorial)
+        if x.dim() == 3:
+            log_h = log_h.sum(-1)
+
+        return log_h
+
+    def _sample(self, num_samples, params, dtype=torch.float32):
+        with torch.no_grad():
+            lmbda = params.reshape(1, self.num_var, *self.array_shape, self.num_dims)
+            lmbda = lmbda.expand(num_samples, * [-1] * (lmbda.dim() - 1))
+            samples = torch.poisson(lmbda)
+            return shift_last_axis_to(samples, 2)
+
+    def _argmax(self, params, dtype=torch.float32):
+        with torch.no_grad():
+            lmbda = params.reshape(self.num_var, *self.array_shape, self.num_dims)
+            lmbda = torch.floor(lmbda)
+            return shift_last_axis_to(lmbda, 1)
+
+if __name__ == "__main__":
+    dist = PoissonArray(num_var=3, num_dims=1, array_shape=[1,], use_em=True)
+    dist.initialize()
+    samples = dist.sample(10).squeeze(-1)
+    prob_a = dist.forward(samples).squeeze(-1)
+
+    params = dist.params
+
+    __import__("pdb").set_trace()
+    # torchdist = torch.distributions.Poisson(dist.reparam(params.squeeze()))
+    torchdist = torch.distributions.Poisson(dist.params.squeeze())
+    prob_b = torchdist.log_prob(samples.squeeze(-1))
+
+
+    print()

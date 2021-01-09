@@ -636,19 +636,3 @@ class PoissonArray(ExponentialFamilyArray):
             lmbda = params.reshape(self.num_var, *self.array_shape, self.num_dims)
             lmbda = torch.floor(lmbda)
             return shift_last_axis_to(lmbda, 1)
-
-if __name__ == "__main__":
-    dist = PoissonArray(num_var=3, num_dims=1, array_shape=[1,], use_em=True)
-    dist.initialize()
-    samples = dist.sample(10).squeeze(-1)
-    prob_a = dist.forward(samples).squeeze(-1)
-
-    params = dist.params
-
-    __import__("pdb").set_trace()
-    # torchdist = torch.distributions.Poisson(dist.reparam(params.squeeze()))
-    torchdist = torch.distributions.Poisson(dist.params.squeeze())
-    prob_b = torchdist.log_prob(samples.squeeze(-1))
-
-
-    print()

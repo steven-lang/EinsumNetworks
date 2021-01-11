@@ -1,6 +1,7 @@
 import torch
 from torch.nn.functional import multilabel_soft_margin_loss
 from utils import one_hot
+from typing import Dict, List
 
 
 class ExponentialFamilyArray(torch.nn.Module):
@@ -636,3 +637,101 @@ class PoissonArray(ExponentialFamilyArray):
             lmbda = params.reshape(self.num_var, *self.array_shape, self.num_dims)
             lmbda = torch.floor(lmbda)
             return shift_last_axis_to(lmbda, 1)
+
+class MultiDistArray(ExponentialFamilyArray):
+    """
+    Implementation of a leaf layer that allows for differentent exponential families for different RV subsets.
+    E.g. for in input with 10 RV we may want RVs 0-3 and 9 to be Gaussian, 4-7 to be Poisson and 8 to be Categorical.
+
+    The main idea is to pass a dictionary of exponential family type that maps to a list of indices (scopes).
+    E.g. for the above described example:
+    {
+        NormalArray:  [0,1,2,3,9]
+        PoissonArray:  [4,5,6,7]
+        CategoricalArray:  [8]
+    }
+
+    """
+
+    def __init__(self, num_var, num_dims, array_shape, exponential_family_to_scope_dict: dict, exponential_family_args_dict: dict, use_em=True):
+        super(MultiDistArray, self).__init__(num_var, num_dims, array_shape, num_dims, use_em=use_em)
+        self.arrays_scope_dict: Dict[ExponentialFamilyArray, List[int]] = {}
+        for array_cls, scopes in exponential_family_to_scope_dict.items():
+            # Construct exponential family with args
+            array_args = exponential_family_args_dict[array_cls]
+            array = array_cls(array_shape=array_shape, use_em=use_em, num_dims=num_dims, num_var=len(scopes), **array_args)
+            self.arrays_scope_dict[array] = scopes
+            self.add_module(name=array_cls.__name__, module=array)
+
+    @property
+    def _device(self):
+        """Hack to obtain the device the subarrays resides on."""
+        for array in self.arrays_scope_dict.keys():
+            if hasattr(array, "params"):
+                return array.params.device
+        raise RuntimeError("Could not find params array to obtain device in any subarray.")
+
+    def initialize(self, initializer="default"):
+        # Call initialize method for all arrays
+        for array in self.arrays_scope_dict.keys():
+            array.initialize(initializer)
+
+    def forward(self, x):
+        """
+        The forward pass consists of forwarding the single scope subsets to the responsible arrays
+        and reconstruct the original order of scopes afterwards.
+        """
+        # Create tensor to collect lls results
+        ll = torch.empty((x.shape[0], x.shape[1], *self.array_shape), device=x.device, dtype=x.dtype)
+
+        # For each array: select input subset and place the lls into the output at the correct pos.
+        for array, scopes in self.arrays_scope_dict.items():
+            x_subset = x[:, scopes]
+            ll[:, scopes] = array(x_subset)
+
+        return ll
+
+    def reparam_function(self):
+        """No-op since this layer is not parametrized."""
+        return None
+
+    def sample(self, num_samples=1, **kwargs):
+        samples = torch.empty(num_samples, self.num_var, self.num_dims, *self.array_shape, dtype=torch.float32, device=self._device)
+        for array, scopes in self.arrays_scope_dict.items():
+            samples_subset = array.sample(num_samples, **kwargs)
+            samples[:, scopes] = samples_subset
+
+        return samples
+
+    def argmax(self, **kwargs):
+        argmax = torch.empty(self.num_var, self.num_dims, *self.array_shape, dtype=torch.float32, device=self._device)
+        for array, scopes in self.arrays_scope_dict.items():
+            argmax_subset = array.argmax(**kwargs)
+            argmax[scopes] = argmax_subset
+
+        return argmax
+
+    def em_set_hyperparams(self, online_em_frequency, online_em_stepsize, purge=True):
+        """Pass to all subarrays."""
+        for array in self.arrays_scope_dict.keys():
+            array.em_set_hyperparams(online_em_frequency, online_em_stepsize, purge)
+
+    def em_purge(self):
+        """Pass to all subarrays."""
+        for array in self.arrays_scope_dict.keys():
+            array.em_purge()
+
+    def em_process_batch(self):
+        """Pass to all subarrays."""
+        for array in self.arrays_scope_dict.keys():
+            array.em_process_batch()
+
+    def em_update(self, _triggered=False):
+        """Pass to all subarrays."""
+        for array in self.arrays_scope_dict.keys():
+            array.em_update(_triggered)
+
+    def set_marginalization_idx(self, idx):
+        """Pass to all subarrays."""
+        for array in self.arrays_scope_dict.keys():
+            array.set_marginalization_idx(idx)
